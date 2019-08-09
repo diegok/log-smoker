@@ -1,0 +1,247 @@
+#!/usr/bin/env perl
+use Mojolicious::Lite -signatures;
+use Mojo::JSON qw/ decode_json /;
+use IO::Pipe;
+
+my $config = plugin Config => { default => {
+    limit       => 3000,
+    cmd_init    => "/usr/bin/journalctl -f --no-pager --output json -n 3000",
+    cmd         => "/usr/bin/journalctl -f --no-pager --output json -n 0",
+    cmd_timeout => 300
+}};
+
+my ( $ws, $logs, $limit ) = ({}, [], $config->{limit});
+
+init_stream(
+    cmd_init => $config->{cmd_init},
+    cmd      => $config->{cmd},
+    timeout  => $config->{cmd_timeout},
+);
+
+get '/' => sub($c) {
+    $c->render(template => 'index');
+};
+
+get '/stats' => sub($c) {
+    $c->render( json => { clients => {
+        map { $_ => {
+            remote_addr => $ws->{$_}{conn}->tx->remote_address,
+            active      => !!Mojo::IOLoop->stream($ws->{$_}{conn}->tx->connection)||0,
+            filter      => ($ws->{$_}{filter} || '').''
+        }} keys %$ws
+    }});
+};
+
+get '/logs-old' => sub($c) {
+    $c->render( json => [ slice_logs($c, $limit) ] );
+};
+
+websocket '/logs' => sub($c) {
+    $c->inactivity_timeout(0);
+    $ws->{$c->req->request_id}{conn}  = $c;
+    $ws->{$c->req->request_id}{limit} = $c->param('n') || $limit;
+
+    $c->app->log->debug("Realtime connection[@{[ $c->req->request_id ]}] accepted from @{[ $c->tx->remote_address ]}");
+
+    $c->on(finish => sub($c, $code, $reason='No reason') {
+        delete $ws->{$c->req->request_id};
+        $c->app->log->debug("Realtime connection[@{[ $c->req->request_id ]}] closed with code $code");
+    });
+
+    $c->on(message => sub($c, $msg) {
+        $c->app->log->debug("Filter updated on connection[@{[ $c->req->request_id ]}]: $msg");
+
+        my $filter;
+        if ( $msg =~ /\S/ ) {
+            $ws->{$c->req->request_id}{filter} = $filter = qr/$msg/;
+        }
+        else {
+            delete $ws->{$c->req->request_id}{filter};
+        }
+
+        for ( slice_logs($c) ) {
+            next unless _match( $_, $filter );
+            $c->send({ json => $_ });
+        }
+    });
+
+    $c->send({ json => $_ }) for slice_logs($c, $ws->{$c->req->request_id}{limit});
+};
+
+app->start;
+
+sub slice_logs($c, $default=0) {
+    my $num = abs(($c->param('n')||$default)+0) || return ();
+    $num = $limit if $limit < $num;
+    @{$logs}[-$num .. -1];
+}
+
+sub init_stream( %opt ) {
+    $opt{timeout} //= 60;
+
+    state $id = _new_stream( $opt{cmd_init} || $opt{cmd}, $opt{timeout} );
+
+    Mojo::IOLoop->recurring( 1 => sub($loop) {
+        return if Mojo::IOLoop->stream($id);;
+        app->log->info("Re-opening stream!");
+        $id = _new_stream( $opt{cmd}, $opt{timeout} );
+    }) if $opt{timeout};
+}
+
+sub _new_stream( $cmd, $timeout ) {
+    my $stream = Mojo::IOLoop::Stream->new(IO::Pipe->new->reader($cmd))->timeout($timeout);
+
+    $stream->on(read => sub {
+        my ($stream, $bytes) = @_;
+        state $buffer = '';
+
+        my @lines = split(/\n/, $buffer.$bytes, -1);
+        $buffer = pop @lines;
+        for my $line (@lines) {
+            _on_log(decode_json($line))
+        }
+    });
+    $stream->on(error => sub {
+      my ($stream, $err) = @_;
+        app->log->info("Stream error: $err");
+    });
+    $stream->on(timeout => sub {
+      my $stream = shift;
+      app->log->info("Stream timed-out");
+    });
+    $stream->on(close => sub {
+        my $stream = shift;
+        app->log->info("Stream closed");
+    });
+
+    Mojo::IOLoop->stream($stream);
+}
+
+sub _on_log($log) {
+    shift @$logs if @$logs == $limit;
+    push @$logs, $log;
+    for my $id (keys %$ws) {
+        next unless _match( $log, $ws->{$id}{filter} );
+        Mojo::IOLoop->stream($ws->{$id}{conn}->tx->connection)
+          ? $ws->{$id}{conn}->send({ json => $log })
+          : delete $ws->{$id};
+    }
+}
+
+sub _match($log, $filter) {
+  return 1 unless defined $filter; # no filter
+  $log->{MESSAGE} =~ $filter;
+}
+
+__DATA__
+
+@@ index.html.ep
+% layout 'default';
+% title 'Log smoker';
+<div id="app" v-bind:class="[state]">
+  <ul class="logs">
+    <li v-for="log in logs" v-bind:title="log._CMDLINE || log._EXE">
+      <span class="date">{{ dateStr(log.__REALTIME_TIMESTAMP) }}</span>
+      <span class="host">{{ log._HOSTNAME }}</span>
+      <span class="identifier">{{ log.SYSLOG_IDENTIFIER }}</span>[<span class="pid">{{ log._PID || 0 }}</span>]:
+      <span class="message">{{ log.MESSAGE }}</span>
+    </li>
+  </ul>
+  <div id="prompt">
+    <input v-model="filter" placeholder="Regexp to filter logs">
+  </div>
+</div>
+<script>
+var app = new Vue({
+  el: '#app',
+  data: {
+    logs: [],
+    filter: '',
+    state: 'offline',
+    filterDebounce: null,
+    socket: null
+  },
+  methods: {
+    dateStr: function(longEpoch) {
+      const months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" ];
+      var dt = new Date(longEpoch * 0.001);
+      return `${ months[dt.getMonth()] } ${ dt.getDay() } ${ dt.getHours() }:${ dt.getMinutes() }:${ dt.getSeconds() }`;
+    },
+    pushLog: function(log) {
+      app.logs.push( log );
+      if ( app.logs.length > 200 ) app.logs.shift();
+      var logs = this.$el.querySelector(".logs");
+      this.$nextTick(function() {
+        logs.scrollTop = logs.scrollHeight;
+      });
+    },
+    clearLogs: function() { this.logs = [] },
+    connect: function() {
+      const app    = this;
+      const socket = new WebSocket(app.socketAddr());
+      socket.onopen = function(event) {
+        app.state  = 'online'
+        app.socket = socket;
+      };
+      socket.onclose = function(event) {
+        app.state = 'offline';
+        app.socket = null;
+        //TODO: reconnect on a timer?
+      };
+      socket.onmessage = function(event) {
+        const data = JSON.parse(event.data);
+        if ( data ) app.pushLog(data);
+      };
+    },
+    socketAddr: function() {
+      const loc = window.location;
+      let ws_uri = loc.protocol === "https:" ? "wss:" : "ws:";
+      ws_uri += "//" + loc.host + "/logs?n=200" ;
+      return ws_uri;
+    }
+  },
+  watch: {
+    filter: function( current, old ) {
+      let app = this;
+      if ( app.filterDebounce ) window.clearTimeout(app.filterDebounce);
+      this.filterDebounce = window.setTimeout(function(){
+        if ( app.socket ) {
+          app.clearLogs();
+          app.socket.send(current);
+        }
+      }, 250);
+    }
+  },
+  mounted() { this.connect() }
+});
+
+
+</script>
+
+@@ layouts/default.html.ep
+<!DOCTYPE html>
+<html>
+  <head>
+    <title><%= title %></title>
+    <script src="https://cdn.jsdelivr.net/npm/vue/dist/vue.js"></script>
+    <style>
+    body {
+      background: #333; color: #eee; width:100%; height: 100%; margin:0; padding:0;
+      font-family: Lucida Console,Lucida Sans Typewriter,monaco,Bitstream Vera Sans Mono,monospace;
+    }
+    #app { margin:0; padding: 0; display: flex; flex-direction: column; height:100%; position:fixed; width: 100%; }
+    .offline { background: #F48024; }
+    ul.logs { margin:3px; padding: 10px; background: #111; height: 100%; overflow: auto; }
+    ul.logs > li { list-style: none; padding: 2px 0; }
+    #prompt { text-align: center; padding: 15px 10px; }
+    #prompt input { width: 98% }
+    .host { color: #91821D; }
+    .identifier { color: #2C8DCB; }
+    .pid { color: #2FA198; }
+    .pink { #CD3981 }
+    </style>
+  </head>
+  <body><%= content %></body>
+</html>
+
+
